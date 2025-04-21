@@ -14,29 +14,57 @@ import (
 	"github.com/joho/godotenv"
 )
 
-var clients = make(map[*websocket.Conn]bool)
+type LiveMatch struct {
+	ID         string `json:"ID"`
+	Name       string `json:"NA"`
+	Country    string `json:"CT"`
+	League     string `json:"CC"`
+	Team1      string `json:"T1"`
+	Team2      string `json:"T2"`
+	Score      string `json:"SS"`
+	Minute     string `json:"TM"`
+	UpdateTime string `json:"TU"`
+	Type       string `json:"type"`
 
+	Source     string `json:"source"`
+	UpdatedAt  string `json:"updated_at"`
+	MatchTitle string `json:"match_title"`
+}
+
+var clients = make(map[*websocket.Conn]bool)
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// ⚠️ Разрешаем соединение с любого фронта (удобно для dev)
-		return true
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func main() {
+	// Загрузка .env
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("⚠️ .env не найден, используются системные переменные")
+	}
+
+	go pollBookiesAPI()
+
+	router := gin.Default()
+	router.GET("/ws", handleWS)
+
+	log.Println("🚀 Сервер слушает порт 8083")
+	if err := router.Run(":8083"); err != nil {
+		log.Fatal("❌ Ошибка запуска:", err)
+	}
 }
 
 func handleWS(c *gin.Context) {
-	log.Println("➡️ WebSocket запрос...")
-
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Println("❌ Ошибка апгрейда:", err)
+		log.Println("❌ WebSocket upgrade error:", err)
 		return
 	}
 	defer conn.Close()
 
 	clients[conn] = true
-	log.Println("🔌 Клиент подключён:", conn.RemoteAddr())
+	log.Println("🔌 WebSocket клиент подключён:", conn.RemoteAddr())
 
-	// Держим соединение живым — читаем сообщения
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
@@ -47,45 +75,6 @@ func handleWS(c *gin.Context) {
 	}
 }
 
-func broadcastLoop() {
-	for {
-		time.Sleep(10 * time.Second)
-
-		message := []map[string]interface{}{
-			{
-				"type": "EV",
-				"NA":   "Тестовый матч",
-				"CT":   "Лига отладки",
-				"ID":   time.Now().Format("15:04:05"),
-			},
-		}
-
-		for conn := range clients {
-			err := conn.WriteJSON(message)
-			if err != nil {
-				log.Println("❌ Ошибка отправки:", err)
-				conn.Close()
-				delete(clients, conn)
-			} else {
-				log.Printf("📤 Отправлено клиенту: %v", conn.RemoteAddr())
-			}
-		}
-	}
-}
-
-func pingLoop() {
-	for {
-		time.Sleep(15 * time.Second)
-		for conn := range clients {
-			err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"ping","ts":"`+time.Now().Format("15:04:05")+`"}`))
-			if err != nil {
-				log.Println("❌ Ping не прошёл:", err)
-				conn.Close()
-				delete(clients, conn)
-			}
-		}
-	}
-}
 func pollBookiesAPI() {
 	url := os.Getenv("BOOKIES_API_URL")
 	if url == "" {
@@ -108,7 +97,7 @@ func pollBookiesAPI() {
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			log.Printf("❌ Ошибка чтения ответа API: %v", err)
+			log.Printf("❌ Ошибка чтения тела ответа: %v", err)
 			continue
 		}
 
@@ -120,72 +109,85 @@ func pollBookiesAPI() {
 
 		success, ok := raw["success"].(float64)
 		if !ok || success != 1 {
-			log.Println("⚠️ Ответ API: success != 1")
+			log.Println("⚠️ API вернул success != 1")
 			continue
 		}
 
-		// 🎯 Разбор событий
 		results, ok := raw["results"].([]interface{})
 		if !ok || len(results) == 0 {
-			log.Println("⚠️ Нет результатов в ответе")
+			log.Println("⚠️ Пустые results")
 			continue
 		}
 
 		events, ok := results[0].([]interface{})
 		if !ok {
-			log.Println("⚠️ Формат событий не []interface{}")
+			log.Println("⚠️ Неверный формат results[0]")
 			continue
 		}
 
-		clean := make([]map[string]interface{}, 0)
+		matches := make([]LiveMatch, 0)
 
 		for _, ev := range events {
 			evMap, ok := ev.(map[string]interface{})
 			if !ok {
 				continue
 			}
-
-			if t, ok := evMap["type"].(string); !ok || t != "EV" {
+			match, ok := toLiveMatch(evMap)
+			if !ok {
 				continue
 			}
-
-			if _, ok := evMap["NA"]; !ok {
-				continue
-			}
-
-			clean = append(clean, evMap)
-			log.Printf("✅ Матч: %s [%s]", evMap["NA"], evMap["ID"])
+			log.Printf("✅ Добавлен матч: %s [%s]", match.Name, match.ID)
+			matches = append(matches, match)
 		}
 
-		log.Printf("📡 Отправлено событий: %d", len(clean))
-		broadcastJSON(clean)
+		log.Printf("📡 Отправлено матчей: %d", len(matches))
+		broadcastJSON(matches)
 	}
 }
+
 func broadcastJSON(data interface{}) {
 	for conn := range clients {
 		err := conn.WriteJSON(data)
 		if err != nil {
-			log.Println("❌ Ошибка при отправке клиенту:", err)
+			log.Printf("❌ Ошибка отправки клиенту: %v", err)
 			conn.Close()
 			delete(clients, conn)
-		} else {
-			log.Printf("📤 Отправлено клиенту: %v", conn.RemoteAddr())
 		}
 	}
 }
-func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("⚠️ .env не найден, используются переменные окружения системы")
-	}
-	go pollBookiesAPI()
-	go pingLoop()
-	
-	router := gin.Default()
-	router.GET("/ws", handleWS)
 
-	log.Println("🚀 Сервер слушает порт :8083")
-	if err := router.Run(":8083"); err != nil {
-		log.Fatal("❌ Ошибка запуска сервера:", err)
+func toLiveMatch(ev map[string]interface{}) (LiveMatch, bool) {
+	if t, ok := ev["type"].(string); !ok || t != "EV" {
+		return LiveMatch{}, false
 	}
+	if _, ok := ev["NA"]; !ok {
+		return LiveMatch{}, false
+	}
+
+	match := LiveMatch{
+		ID:         getString(ev, "ID"),
+		Name:       getString(ev, "NA"),
+		Country:    getString(ev, "CT"),
+		League:     getString(ev, "CC"),
+		Team1:      getString(ev, "T1"),
+		Team2:      getString(ev, "T2"),
+		Score:      getString(ev, "SS"),
+		Minute:     getString(ev, "TM"),
+		UpdateTime: getString(ev, "TU"),
+		Type:       getString(ev, "type"),
+		Source:     "bookiesapi",
+		UpdatedAt:  time.Now().Format("2006-01-02 15:04:05"),
+	}
+
+	match.MatchTitle = match.Team1 + " vs " + match.Team2
+	return match, true
+}
+
+func getString(m map[string]interface{}, key string) string {
+	if val, ok := m[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return ""
 }
